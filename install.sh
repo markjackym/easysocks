@@ -1,238 +1,365 @@
 #!/usr/bin/env bash
-set -euo pipefail
-IFS=$'\n\t'
 
-# GOST(v3) SOCKS5 一键安装：可选认证(密码可空)、流量统计(默认开)、自定义端口、IPv4/IPv6 出站选择
-# 用法：bash gost-socks5.sh {install|uninstall|status|traffic}
-: "${GOST_TAG:=}"   # 例如：GOST_TAG=v3.2.6
+# 定义颜色
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+PLAIN='\033[0m'
 
-BIN=/usr/local/bin/gost
-DIR=/etc/gost
-CFG=$DIR/gost.yml
-SVC=/etc/systemd/system/gost.service
+# 定义脚本变量
+GOST_VERSION="2.12.0"
+GOST_INSTALL_PATH="/usr/local/bin"
+GOST_SERVICE_FILE="/etc/systemd/system/gost.service"
+GOST_CONFIG_DIR="/etc/gost"
+GOST_CONFIG_FILE="${GOST_CONFIG_DIR}/config.json"
 
-die(){ echo "[!] $*" >&2; exit 1; }
-have(){ command -v "$1" >/dev/null 2>&1; }
-need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请用 root 运行"; }
-need_systemd(){ have systemctl || die "仅支持 systemd Linux"; }
-
-pm_install(){
-  if have apt-get; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null
-  elif have yum; then
-    yum install -y "$@" >/dev/null
-  elif have dnf; then
-    dnf install -y "$@" >/dev/null
-  else
-    die "缺少包管理器(apt/yum/dnf)，无法安装依赖: $*"
-  fi
-}
-
-ensure_deps(){
-  local need=()
-  have curl || need+=(curl)
-  have tar  || need+=(tar)
-  if ! have ip; then
-    if have apt-get; then need+=(iproute2); else need+=(iproute); fi
-  fi
-  ((${#need[@]})) && pm_install "${need[@]}"
-}
-
-arch_asset(){
-  case "$(uname -m)" in
-    x86_64) grep -qm1 avx2 /proc/cpuinfo 2>/dev/null && echo amd64v3 || echo amd64 ;;
-    aarch64|arm64) echo arm64 ;;
-    armv7l|armv7) echo armv7 ;;
-    i386|i686) echo 386 ;;
-    *) die "不支持的架构: $(uname -m)" ;;
-  esac
-}
-
-latest_tag(){
-  curl -fsSL https://api.github.com/repos/go-gost/gost/releases/latest \
-    | awk -F'"' '/"tag_name":/ {print $4; exit}'
-}
-
-download(){
-  local tag="$1" asset="$2" out="$3"
-  local u base=(
-    "https://github.com/go-gost/gost/releases/download"
-    "https://ghproxy.com/https://github.com/go-gost/gost/releases/download"
-    "https://mirror.ghproxy.com/https://github.com/go-gost/gost/releases/download"
-  )
-  for u in "${base[@]}"; do
-    if curl -fL --connect-timeout 15 --max-time 180 --retry 2 --retry-delay 1 \
-      -o "$out" "$u/$tag/$asset" >/dev/null 2>&1; then
-      tar -tzf "$out" >/dev/null 2>&1 && return 0 || true
+# 检查是否为 root 用户
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}错误: 本脚本必须以 root 权限运行！${PLAIN}"
+        exit 1
     fi
-    rm -f "$out"
-  done
-  return 1
 }
 
-install_bin(){
-  local tag="${GOST_TAG:-$(latest_tag)}" arch ver asset tmp
-  [[ -n "$tag" ]] || die "获取版本失败(GitHub API)"
-  ver="${tag#v}"; arch="$(arch_asset)"
-
-  while :; do
-    asset="gost_${ver}_linux_${arch}.tar.gz"; tmp="/tmp/$asset"
-    rm -f /tmp/gost "$tmp"
-    if download "$tag" "$asset" "$tmp"; then
-      break
+# 检查操作系统和 systemd
+check_os() {
+    if ! command -v systemctl &> /dev/null; then
+        echo -e "${RED}错误: 本脚本仅支持使用 systemd 的 Linux 系统。${PLAIN}"
+        exit 1
     fi
-    # amd64v3 资源缺失时自动回落
-    if [[ "$arch" == "amd64v3" ]]; then
-      arch="amd64"
-      continue
+}
+
+# 获取系统架构
+get_arch() {
+    case $(uname -m) in
+        x86_64)
+            echo "amd64"
+            ;;
+        aarch64)
+            echo "arm64"
+            ;;
+        armv7l)
+            echo "armv7"
+            ;;
+        *)
+            echo -e "${RED}错误: 不支持的系统架构: $(uname -m)${PLAIN}"
+            exit 1
+            ;;
+    esac
+}
+
+# 安装依赖
+install_dependencies() {
+    echo -e "${YELLOW}正在检查并安装依赖 (curl, tar)...${PLAIN}"
+    if ! command -v curl &> /dev/null || ! command -v tar &> /dev/null; then
+        if command -v yum &> /dev/null; then
+            yum install -y curl tar
+        elif command -v apt-get &> /dev/null; then
+            apt-get update && apt-get install -y curl tar
+        else
+            echo -e "${RED}错误: 无法自动安装依赖。请手动安装 curl 和 tar。${PLAIN}"
+            exit 1
+        fi
     fi
-    die "下载失败：检查网络/DNS/GitHub"
-  done
-
-  tar -xzf "$tmp" -C /tmp >/dev/null
-  [[ -f /tmp/gost ]] || die "解压失败：未找到 gost"
-  install -m 0755 /tmp/gost "$BIN"
-  rm -f /tmp/gost "$tmp"
 }
 
-prompt(){ local m="$1" d="${2:-}" v=""; read -r -p "$m${d:+ (默认 $d)}: " v || true; echo "${v:-$d}"; }
-prompt_secret(){ local m="$1" v=""; read -r -s -p "$m: " v || true; echo >&2; echo "$v"; }
-valid_port(){ [[ "$1" =~ ^[0-9]+$ ]] && ((1<=10#$1 && 10#$1<=65535)); }
+# 安装 gost
+install_gost() {
+    if [ -f "$GOST_SERVICE_FILE" ]; then
+        echo -e "${YELLOW}检测到 gost 已安装，将执行卸载...${PLAIN}"
+        uninstall_gost
+    fi
 
-def4(){ ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'; }
-def6(){ ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'; }
+    echo -e "${GREEN}===== 开始安装 SOCKS5 代理 =====${PLAIN}"
 
-fw_open(){
-  local p="$1"
-  if have firewall-cmd && systemctl is-active --quiet firewalld; then
-    firewall-cmd --zone=public --add-port="$p/tcp" --permanent >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
-  elif have ufw; then
-    ufw allow "$p/tcp" >/dev/null 2>&1 || true
-  fi
-}
-fw_close(){
-  local p="$1"
-  if have firewall-cmd && systemctl is-active --quiet firewalld; then
-    firewall-cmd --zone=public --remove-port="$p/tcp" --permanent >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
-  elif have ufw; then
-    ufw delete allow "$p/tcp" >/dev/null 2>&1 || true
-  fi
-}
+    # 获取用户输入
+    read -p "请输入 SOCKS5 代理的监听端口 (默认 1080): " SOCKS5_PORT
+    SOCKS5_PORT=${SOCKS5_PORT:-1080}
 
-write_cfg(){
-  local port="$1" user="$2" pass="$3" iface="$4" mon="$5" mport="$6"
-  mkdir -p "$DIR"; chmod 700 "$DIR"
-  {
-    echo "services:"
-    echo "- name: socks5"
-    echo "  addr: \":$port\""
-    [[ -n "$iface" ]] && { echo "  metadata:"; echo "    interface: \"$iface\""; }
-    echo "  handler:"
-    echo "    type: socks5"
-    [[ -n "$user" ]] && { echo "    auth:"; echo "      username: \"$user\""; echo "      password: \"$pass\""; }
-    echo "  listener:"
-    echo "    type: tcp"
-    [[ "$mon" == 1 ]] && { echo "metrics:"; echo "  addr: \"127.0.0.1:$mport\""; echo "  path: /metrics"; }
-  } > "$CFG"
-  chmod 600 "$CFG"
-}
+    echo -e "\n请选择 IPv4 / IPv6 出站（监听）方式："
+    echo "  1) 仅 IPv4 (0.0.0.0)"
+    echo "  2) 仅 IPv6 ([::])"
+    echo "  3) IPv4 + IPv6 (默认，双栈)"
+    read -p "请输入选项 [1-3] (默认 3): " IP_MODE
 
-write_svc(){
-  cat > "$SVC" <<EOF
+    local BIND_ADDR=""
+    local STACK_DESC="IPv4+IPv6"
+    case "$IP_MODE" in
+        1)
+            BIND_ADDR="0.0.0.0"
+            STACK_DESC="IPv4"
+            ;;
+        2)
+            BIND_ADDR="[::]"
+            STACK_DESC="IPv6"
+            ;;
+        3|"")
+            BIND_ADDR=""
+            STACK_DESC="IPv4+IPv6"
+            ;;
+        *)
+            echo -e "${YELLOW}输入无效，使用默认 IPv4+IPv6 双栈监听。${PLAIN}"
+            BIND_ADDR=""
+            STACK_DESC="IPv4+IPv6"
+            ;;
+    esac
+
+    read -p "请输入 SOCKS5 代理的用户名 (留空则不设置认证): " SOCKS5_USER
+    
+    if [ -n "$SOCKS5_USER" ]; then
+        read -sp "请输入 SOCKS5 代理的密码: " SOCKS5_PASS
+        echo
+        while [ -z "$SOCKS5_PASS" ]; do
+            echo -e "${RED}密码不能为空！${PLAIN}"
+            read -sp "请重新输入 SOCKS5 代理的密码: " SOCKS5_PASS
+            echo
+        done
+        AUTH_INFO="${SOCKS5_USER}:${SOCKS5_PASS}"
+    fi
+
+    # 下载并安装 gost
+    ARCH=$(get_arch)
+    FILENAME="gost_${GOST_VERSION}_linux_${ARCH}.tar.gz"
+    
+    # 定义多个下载源
+    DOWNLOAD_URLS=(
+        "https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/${FILENAME}"
+        "https://ghproxy.com/https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/${FILENAME}"
+        "https://mirror.ghproxy.com/https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/${FILENAME}"
+    )
+
+    echo -e "${YELLOW}正在下载 gost v${GOST_VERSION} for ${ARCH}...${PLAIN}"
+
+    # 尝试所有下载源
+    download_success=false
+    for url in "${DOWNLOAD_URLS[@]}"; do
+        echo -e "${YELLOW}[尝试] ${url}${PLAIN}"
+        if curl -sL --connect-timeout 15 --max-time 120 "$url" -o "/tmp/gost.tar.gz"; then
+            if tar -tzf "/tmp/gost.tar.gz" &>/dev/null; then
+                echo -e "${GREEN}✓ 下载成功！${PLAIN}"
+                download_success=true
+                break
+            else
+                echo -e "${YELLOW}✗ 文件损坏，尝试下一个源...${PLAIN}"
+            fi
+        else
+            echo -e "${YELLOW}✗ 下载失败，尝试下一个源...${PLAIN}"
+        fi
+        rm -f "/tmp/gost.tar.gz"
+    done
+
+    if [ "$download_success" = false ]; then
+        echo -e "${RED}所有下载源均失败！${PLAIN}"
+        echo -e "${YELLOW}请检查：${PLAIN}"
+        echo "  1. 网络连接是否正常"
+        echo "  2. 能否访问 GitHub"
+        echo "  3. DNS 设置是否正确"
+        echo -e "\n${YELLOW}手动下载地址:${PLAIN}"
+        echo "  https://github.com/ginuerzh/gost/releases/tag/v${GOST_VERSION}"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}正在解压并安装...${PLAIN}"
+    tar -zxf "/tmp/gost.tar.gz" -C "/tmp/"
+    
+    if [ ! -f "/tmp/gost" ]; then
+        echo -e "${RED}错误: 解压后未找到 gost 可执行文件！${PLAIN}"
+        rm -rf /tmp/gost*
+        exit 1
+    fi
+    
+    mv "/tmp/gost" "${GOST_INSTALL_PATH}/gost"
+    chmod +x "${GOST_INSTALL_PATH}/gost"
+
+    # 清理临时文件
+    rm -rf /tmp/gost*
+
+    # 生成监听地址
+    local listen_addr=""
+    if [ -n "$BIND_ADDR" ]; then
+        listen_addr="${BIND_ADDR}:${SOCKS5_PORT}"
+    else
+        # 留空则使用系统默认，通常为双栈
+        listen_addr=":${SOCKS5_PORT}"
+    fi
+
+    # 创建 systemd 服务文件
+    echo -e "${YELLOW}正在创建 systemd 服务...${PLAIN}"
+    
+    local exec_start_cmd="${GOST_INSTALL_PATH}/gost -L socks5://"
+    if [ -n "$AUTH_INFO" ]; then
+        exec_start_cmd+="${AUTH_INFO}@"
+    fi
+    exec_start_cmd+="${listen_addr}"
+
+    cat > "$GOST_SERVICE_FILE" <<EOF
 [Unit]
-Description=GOST SOCKS5 Proxy
-After=network-online.target
-Wants=network-online.target
+Description=Gost SOCKS5 Proxy Service
+After=network.target
+
 [Service]
 Type=simple
-ExecStart=$BIN -C $CFG
-Restart=on-failure
-RestartSec=2
-LimitNOFILE=1048576
+ExecStart=${exec_start_cmd}
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable gost >/dev/null 2>&1 || true
-  systemctl restart gost
+
+    # 保存配置信息
+    mkdir -p "$GOST_CONFIG_DIR"
+    cat > "$GOST_CONFIG_FILE" <<EOF
+{
+  "port": "${SOCKS5_PORT}",
+  "user": "${SOCKS5_USER}",
+  "version": "${GOST_VERSION}",
+  "ip_mode": "${STACK_DESC}",
+  "bind": "${BIND_ADDR}"
+}
+EOF
+
+    # 启动服务
+    echo -e "${YELLOW}正在启动并设置开机自启...${PLAIN}"
+    systemctl daemon-reload
+    systemctl enable gost
+    systemctl start gost
+
+    # 配置防火墙
+    echo -e "${YELLOW}正在配置防火墙...${PLAIN}"
+    if command -v firewall-cmd &> /dev/null && systemctl is-active --quiet firewalld; then
+        firewall-cmd --zone=public --add-port=${SOCKS5_PORT}/tcp --permanent &>/dev/null
+        firewall-cmd --reload &>/dev/null
+    elif command -v ufw &> /dev/null; then
+        ufw allow ${SOCKS5_PORT}/tcp &>/dev/null
+    else
+        echo -e "${YELLOW}警告: 未检测到防火墙，请手动开放端口 ${SOCKS5_PORT}。${PLAIN}"
+    fi
+
+    # 显示安装结果
+    sleep 2
+    if systemctl is-active --quiet gost; then
+        local server_ip=$(curl -s --max-time 5 ip.sb 2>/dev/null || curl -s --max-time 5 ip.me 2>/dev/null || echo "YOUR_SERVER_IP")
+        
+        echo -e "${GREEN}=================================================${PLAIN}"
+        echo -e "${GREEN}       SOCKS5 代理安装成功！${PLAIN}"
+        echo -e "${GREEN}=================================================${PLAIN}"
+        echo -e "服务器地址: ${GREEN}${server_ip}${PLAIN}"
+        echo -e "端口:       ${GREEN}${SOCKS5_PORT}${PLAIN}"
+        echo -e "出站协议栈: ${GREEN}${STACK_DESC}${PLAIN}"
+        if [ -n "$SOCKS5_USER" ]; then
+            echo -e "用户名:     ${GREEN}${SOCKS5_USER}${PLAIN}"
+            echo -e "密码:       ${GREEN}${SOCKS5_PASS}${PLAIN}"
+        else
+            echo -e "认证:       ${YELLOW}未设置${PLAIN}"
+        fi
+        echo -e "${GREEN}=================================================${PLAIN}"
+        echo -e "${YELLOW}请在客户端中使用以上信息进行连接。${PLAIN}"
+    else
+        echo -e "${RED}安装失败！请查看服务状态以获取更多信息:${PLAIN}"
+        echo -e "  journalctl -u gost -n 20"
+    fi
 }
 
-cmd_install(){
-  need_root; need_systemd; ensure_deps
+# 卸载 gost
+uninstall_gost() {
+    if [ ! -f "$GOST_SERVICE_FILE" ]; then
+        echo -e "${RED}错误: 未检测到 gost 安装。${PLAIN}"
+        return 1
+    fi
 
-  local port user pass mon mport out iface=""
-  port="$(prompt "监听端口" 1080)"; valid_port "$port" || die "端口无效: $port"
+    echo -e "${YELLOW}===== 开始卸载 SOCKS5 代理 =====${PLAIN}"
 
-  user="$(prompt "用户名(留空=无认证)" "")"
-  if [[ -n "$user" ]]; then pass="$(prompt_secret "密码(可留空)")"; else pass=""; fi
+    # 读取端口信息
+    SOCKS5_PORT=$(grep -oP '"port":\s*"\K[^"]+' "$GOST_CONFIG_FILE" 2>/dev/null)
 
-  case "$(prompt "流量统计(Prometheus metrics) [Y/n]" Y | tr 'A-Z' 'a-z')" in
-    n|no) mon=0; mport=18080 ;;
-    *) mon=1; mport="$(prompt "Metrics 端口(仅本机访问)" 18080)"; valid_port "$mport" || die "metrics 端口无效: $mport" ;;
-  esac
+    # 停止并禁用服务
+    systemctl stop gost
+    systemctl disable gost
 
-  out="$(prompt "出站选择: 0=自动 4=仅IPv4 6=仅IPv6" 0)"
-  case "$out" in
-    0) iface="" ;;
-    4) iface="$(def4)"; [[ -n "$iface" ]] || die "未检测到默认 IPv4 出站地址" ;;
-    6) iface="$(def6)"; [[ -n "$iface" ]] || die "未检测到默认 IPv6 出站地址" ;;
-    *) die "无效选择: $out" ;;
-  esac
+    # 删除服务文件和二进制文件
+    rm -f "$GOST_SERVICE_FILE"
+    rm -f "${GOST_INSTALL_PATH}/gost"
+    rm -rf "$GOST_CONFIG_DIR"
 
-  [[ -f "$SVC" ]] && cmd_uninstall || true
-  install_bin
-  write_cfg "$port" "$user" "$pass" "$iface" "$mon" "$mport"
-  write_svc
-  fw_open "$port"
+    systemctl daemon-reload
 
-  systemctl is-active --quiet gost || die "启动失败：journalctl -u gost -n 50 --no-pager"
-  echo "[+] OK"
-  echo "Port: $port"
-  [[ -n "$user" ]] && echo "Auth: $user / ${pass:-<empty>}" || echo "Auth: none"
-  [[ "$mon" == 1 ]] && echo "Metrics: http://127.0.0.1:$mport/metrics" || echo "Metrics: off"
-  [[ -n "$iface" ]] && echo "Egress: $iface" || echo "Egress: auto"
+    # 关闭防火墙端口
+    if [ -n "$SOCKS5_PORT" ]; then
+        echo -e "${YELLOW}正在关闭防火墙端口 ${SOCKS5_PORT}...${PLAIN}"
+        if command -v firewall-cmd &> /dev/null && systemctl is-active --quiet firewalld; then
+            firewall-cmd --zone=public --remove-port=${SOCKS5_PORT}/tcp --permanent &>/dev/null
+            firewall-cmd --reload &>/dev/null
+        elif command -v ufw &> /dev/null; then
+            ufw delete allow ${SOCKS5_PORT}/tcp &>/dev/null
+        fi
+    fi
+
+    echo -e "${GREEN}SOCKS5 代理已成功卸载！${PLAIN}"
 }
 
-cmd_uninstall(){
-  need_root; need_systemd
-  local port=""
-  [[ -f "$CFG" ]] && port="$(awk -F'"' '/addr:/{print $2; exit}' "$CFG" | sed 's/^://')"
-  systemctl stop gost >/dev/null 2>&1 || true
-  systemctl disable gost >/dev/null 2>&1 || true
-  rm -f "$SVC"; systemctl daemon-reload >/dev/null 2>&1 || true
-  rm -f "$CFG"; rmdir "$DIR" >/dev/null 2>&1 || true
-  rm -f "$BIN" || true
-  [[ -n "$port" ]] && fw_close "$port" || true
-  echo "[+] 已卸载"
+# 查看状态
+check_status() {
+    if [ ! -f "$GOST_SERVICE_FILE" ]; then
+        echo -e "${RED}错误: 未检测到 gost 安装。${PLAIN}"
+        return 1
+    fi
+    
+    echo -e "${YELLOW}===== 服务状态 =====${PLAIN}"
+    systemctl status gost --no-pager -l
+    
+    if [ -f "$GOST_CONFIG_FILE" ]; then
+        echo -e "\n${YELLOW}===== 配置信息 =====${PLAIN}"
+        if command -v jq &> /dev/null; then
+            jq . "$GOST_CONFIG_FILE"
+        else
+            cat "$GOST_CONFIG_FILE"
+        fi
+    fi
 }
 
-cmd_status(){
-  need_systemd
-  systemctl status gost --no-pager -l || true
-  [[ -f "$CFG" ]] && { echo; echo "---- $CFG (password masked) ----"; sed -E 's/(password:\s*).*/\1"***"/' "$CFG" || true; }
+# 显示主菜单
+show_menu() {
+    clear
+    echo "=================================================="
+    echo " SOCKS5 一键安装/卸载脚本 (基于 gost v${GOST_VERSION})"
+    echo "=================================================="
+    echo -e " ${GREEN}1. 安装 SOCKS5 代理${PLAIN}"
+    echo -e " ${RED}2. 卸载 SOCKS5 代理${PLAIN}"
+    echo -e " ${YELLOW}3. 查看 SOCKS5 代理状态${PLAIN}"
+    echo " ──────────────────────────────────"
+    echo " 0. 退出脚本"
+    echo "=================================================="
+    read -p "请输入你的选择 [0-3]: " choice
+
+    case $choice in
+        1)
+            install_gost
+            ;;
+        2)
+            uninstall_gost
+            ;;
+        3)
+            check_status
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}无效的选择，请输入正确的数字。${PLAIN}"
+            sleep 2
+            show_menu
+            ;;
+    esac
 }
 
-cmd_traffic(){
-  [[ -f "$CFG" ]] || die "未安装"
-  local mport body in out
-  mport="$(awk -F'"' '/metrics:/{f=1} f&&/addr:/{print $2; exit}' "$CFG" 2>/dev/null | awk -F: '{print $NF}')"
-  [[ -n "$mport" ]] || die "未开启 metrics"
-  body="$(curl -fsS "http://127.0.0.1:$mport/metrics" 2>/dev/null)" || die "无法访问 metrics(端口 $mport)"
-  in="$(awk '/gost_service_transfer_input_bytes_total\{[^}]*service="socks5"/{print $2}' <<<"$body" | tail -n1)"
-  out="$(awk '/gost_service_transfer_output_bytes_total\{[^}]*service="socks5"/{print $2}' <<<"$body" | tail -n1)"
-  [[ -n "$in" && -n "$out" ]] || die "未找到 socks5 指标(可能无流量)"
-  echo "IN : $in bytes"
-  echo "OUT: $out bytes"
+# 脚本主入口
+main() {
+    check_root
+    check_os
+    install_dependencies
+    show_menu
 }
 
-case "${1:-install}" in
-  install) cmd_install ;;
-  uninstall|remove) cmd_uninstall ;;
-  status) cmd_status ;;
-  traffic|stats) cmd_traffic ;;
-  *) die "用法：$0 {install|uninstall|status|traffic}" ;;
-esac
-
+main
